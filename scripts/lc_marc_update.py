@@ -1,15 +1,18 @@
 #!/usr/bin/env python
 
-from openlibrary.catalog.importer.scribe import BadImport
-from openlibrary.catalog.read_rc import read_rc
-from openlibrary import config
+import argparse
+import json
+import sys
 from ftplib import FTP
 from time import sleep
-from lxml import etree
-import sys
+
 import httplib
-import json
-import argparse
+import lxml.etree
+from lxml import etree
+
+from openlibrary import config
+from openlibrary.catalog.importer.scribe import BadImport
+from openlibrary.catalog.read_rc import read_rc  # noqa: F401 side effects may be needed
 
 parser = argparse.ArgumentParser(description='Library of Congress MARC update')
 parser.add_argument('--config', default='openlibrary.yml')
@@ -57,7 +60,9 @@ attempts = 10
 wait = 5
 for attempt in range(attempts):
     try:
-        root = etree.parse(url).getroot()
+        root = etree.parse(
+            url, parser=lxml.etree.XMLParser(resolve_entities=False)
+        ).getroot()
         break
     except:
         if attempt == attempts - 1:
@@ -145,8 +150,8 @@ for f in to_upload:
         continue
 
     loc_file = item_id + '/' + f
-    for p, l, marc_data in iter_marc(data):
-        loc = '%s:%d:%d' % (loc_file, p, l)
+    for pos, length, marc_data in iter_marc(data):
+        loc = '%s:%d:%d' % (loc_file, pos, length)
         headers['x-archive-meta-source-record'] = 'marc:' + loc
         try:
             h1 = httplib.HTTPConnection('openlibrary.org')

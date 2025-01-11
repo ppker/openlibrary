@@ -8,15 +8,15 @@ import sys
 import time
 import traceback
 from types import TracebackType
-from typing import Any, Optional
+from typing import Any
 
-from infogami.utils.app import find_page, find_view, find_mode
-from openlibrary.core import stats as graphite_stats
 import web
-from infogami import config
-from infogami.utils import delegate, stats
 
 import openlibrary.plugins.openlibrary.filters as stats_filters
+from infogami import config
+from infogami.utils import stats
+from infogami.utils.app import find_mode, find_page, find_view
+from openlibrary.core import stats as graphite_stats
 
 logger = logging.getLogger("openlibrary.stats")
 TIME_BUCKETS = [10, 100, 1000, 5000, 10000, 20000]  # in ms
@@ -167,8 +167,8 @@ def _get_top_level_path_for_metric(full_path: str) -> str:
 
 class GraphiteRequestStats:
     def __init__(self):
-        self.start: Optional[float] = None
-        self.end: Optional[float] = None
+        self.start: float | None = None
+        self.end: float | None = None
         self.state = None  # oneof 'started', 'completed'
         self.method = 'unknown'
         self.path_page_name = 'unknown'

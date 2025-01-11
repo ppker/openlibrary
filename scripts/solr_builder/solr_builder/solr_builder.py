@@ -1,23 +1,24 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
-from collections.abc import Awaitable, Iterator
-
-
-from configparser import ConfigParser
 import logging
 import time
 import uuid
 from collections import namedtuple
+from collections.abc import Awaitable, Iterator
+from configparser import ConfigParser
+from pathlib import Path
+from typing import Any, Literal, Self
 
+import aiofiles
 import psycopg2
 
+from openlibrary.core.bookshelves import Bookshelves
 from openlibrary.core.ratings import Ratings, WorkRatingsSummary
-from openlibrary.solr import update_work
-from openlibrary.solr.data_provider import DataProvider
-from openlibrary.solr.update_work import load_configs, update_keys
-
+from openlibrary.solr import update
+from openlibrary.solr.data_provider import DataProvider, WorkReadingLogSolrSummary
+from openlibrary.solr.update import load_configs, update_keys
+from openlibrary.utils.open_syllabus_project import set_osp_dump_location
 
 logger = logging.getLogger("openlibrary.solr-builder")
 
@@ -66,9 +67,10 @@ class LocalPostgresDataProvider(DataProvider):
         self._conn: psycopg2._psycopg.connection = None
         self.cache: dict = {}
         self.cached_work_editions_ranges: list = []
-        self.cached_work_ratings: dict[str, WorkRatingsSummary] = dict()
+        self.cached_work_ratings: dict[str, WorkRatingsSummary] = {}
+        self.cached_work_reading_logs: dict[str, WorkReadingLogSolrSummary] = {}
 
-    def __enter__(self) -> LocalPostgresDataProvider:
+    def __enter__(self) -> Self:
         """
         :rtype: LocalPostgresDataProvider
         """
@@ -142,33 +144,29 @@ class LocalPostgresDataProvider(DataProvider):
         cur.close()
 
     def cache_edition_works(self, lo_key, hi_key):
-        q = """
+        q = f"""
             SELECT works."Key", works."JSON"
             FROM "test" editions
             INNER JOIN test works
                 ON editions."JSON" -> 'works' -> 0 ->> 'key' = works."Key"
             WHERE editions."Type" = '/type/edition'
-                AND '{}' <= editions."Key" AND editions."Key" <= '{}'
-        """.format(
-            lo_key, hi_key
-        )
+                AND '{lo_key}' <= editions."Key" AND editions."Key" <= '{hi_key}'
+        """
         self.query_all(q, json_cache=self.cache)
 
     def cache_work_editions(self, lo_key, hi_key):
-        q = """
+        q = f"""
             SELECT "Key", "JSON"
             FROM "test"
             WHERE "Type" = '/type/edition'
-                AND '{}' <= "JSON" -> 'works' -> 0 ->> 'key'
-                AND "JSON" -> 'works' -> 0 ->> 'key' <= '{}'
-        """.format(
-            lo_key, hi_key
-        )
+                AND '{lo_key}' <= "JSON" -> 'works' -> 0 ->> 'key'
+                AND "JSON" -> 'works' -> 0 ->> 'key' <= '{hi_key}'
+        """
         self.query_all(q, json_cache=self.cache)
         self.cached_work_editions_ranges.append((lo_key, hi_key))
 
     def cache_edition_authors(self, lo_key, hi_key):
-        q = """
+        q = f"""
             SELECT authors."Key", authors."JSON"
             FROM "test" editions
             INNER JOIN test works
@@ -177,15 +175,13 @@ class LocalPostgresDataProvider(DataProvider):
                 ON works."JSON" -> 'authors' -> 0 -> 'author' ->> 'key' = authors."Key"
             WHERE editions."Type" = '/type/edition'
                 AND editions."JSON" -> 'works' -> 0 ->> 'key' IS NULL
-                AND '{}' <= editions."Key" AND editions."Key" <= '{}'
-        """.format(
-            lo_key, hi_key
-        )
+                AND '{lo_key}' <= editions."Key" AND editions."Key" <= '{hi_key}'
+        """
         self.query_all(q, json_cache=self.cache)
 
     def cache_work_authors(self, lo_key, hi_key):
         # Cache upto first five authors
-        q = """
+        q = f"""
             SELECT authors."Key", authors."JSON"
             FROM "test" works
             INNER JOIN "test" authors ON (
@@ -196,10 +192,8 @@ class LocalPostgresDataProvider(DataProvider):
                 works."JSON" -> 'authors' -> 4 -> 'author' ->> 'key' = authors."Key"
             )
             WHERE works."Type" = '/type/work'
-            AND '{}' <= works."Key" AND works."Key" <= '{}'
-        """.format(
-            lo_key, hi_key
-        )
+            AND '{lo_key}' <= works."Key" AND works."Key" <= '{hi_key}'
+        """
         self.query_all(q, json_cache=self.cache)
 
     def cache_work_ratings(self, lo_key, hi_key):
@@ -223,6 +217,28 @@ class LocalPostgresDataProvider(DataProvider):
                     [row[f'ratings_count_{i}'] for i in range(1, 6)]
                 )
             )
+
+    def cache_work_reading_logs(self, lo_key: str, hi_key: str):
+        per_shelf_fields = ', '.join(
+            f"""
+                '{json_name}_count', count(*) filter (where "Shelf" = '{human_name}')
+            """.strip()
+            for json_name, human_name in zip(
+                Bookshelves.PRESET_BOOKSHELVES_JSON.keys(),
+                Bookshelves.PRESET_BOOKSHELVES.keys(),
+            )
+        )
+        q = f"""
+            SELECT "WorkKey", json_build_object(
+                'readinglog_count', count(*),
+                {per_shelf_fields}
+            )
+            FROM "reading_log"
+            WHERE '{lo_key}' <= "WorkKey" AND "WorkKey" <= '{hi_key}'
+            GROUP BY "WorkKey"
+            ORDER BY "WorkKey" asc
+        """
+        self.query_all(q, json_cache=self.cached_work_reading_logs)
 
     async def cache_cached_editions_ia_metadata(self):
         ocaids = list({doc['ocaid'] for doc in self.cache.values() if 'ocaid' in doc})
@@ -270,6 +286,9 @@ class LocalPostgresDataProvider(DataProvider):
     def get_work_ratings(self, work_key: str) -> WorkRatingsSummary | None:
         return self.cached_work_ratings.get(work_key)
 
+    def get_work_reading_log(self, work_key: str) -> WorkReadingLogSolrSummary | None:
+        return self.cached_work_reading_logs.get(work_key)
+
     async def get_document(self, key):
         if key in self.cache:
             logger.debug("get_document cache hit %s", key)
@@ -310,7 +329,7 @@ async def simple_timeit_async(awaitable: Awaitable):
 
 
 def build_job_query(
-    job: Literal['works', 'orphans', 'authors'],
+    job: Literal['works', 'orphans', 'authors', 'lists'],
     start_at: str | None = None,
     offset: int = 0,
     last_modified: str | None = None,
@@ -323,7 +342,12 @@ def build_job_query(
     :param offset: Use `start_at` if possible.
     :param last_modified: Only import docs modified after this date.
     """
-    type = {"works": "work", "orphans": "edition", "authors": "author"}[job]
+    type = {
+        "works": "work",
+        "orphans": "edition",
+        "authors": "author",
+        "lists": "list",
+    }[job]
 
     q_select = """SELECT "Key", "JSON" FROM test"""
     q_where = """WHERE "Type" = '/type/%s'""" % type
@@ -348,12 +372,13 @@ def build_job_query(
     if job == 'orphans':
         q_where += """ AND "JSON" -> 'works' -> 0 ->> 'key' IS NULL"""
 
-    return ' '.join([q_select, q_where, q_order, q_offset, q_limit])
+    return f"{q_select} {q_where} {q_order} {q_offset} {q_limit}"
 
 
 async def main(
     cmd: Literal['index', 'fetch-end'],
-    job: Literal['works', 'orphans', 'authors'],
+    job: Literal['works', 'orphans', 'authors', 'lists'],
+    osp_dump: Path | None = None,
     postgres="postgres.ini",
     ol="http://ol/",
     ol_config="../../conf/openlibrary.yml",
@@ -390,7 +415,9 @@ async def main(
     )
 
     if solr:
-        update_work.set_solr_base_url(solr)
+        update.set_solr_base_url(solr)
+
+    set_osp_dump_location(osp_dump)
 
     PLogEntry = namedtuple(
         'PLogEntry',
@@ -508,10 +535,10 @@ async def main(
 
         if progress:
             # Clear the file
-            with open(progress, 'w') as f:
-                f.write('')
-            with open(progress, 'a') as f:
-                f.write('Calculating total... ')
+            async with aiofiles.open(progress, 'w') as f:
+                await f.write('')
+            async with aiofiles.open(progress, 'a') as f:
+                await f.write('Calculating total... ')
 
         start = time.time()
         q_count = """SELECT COUNT(*) FROM(%s) AS foo""" % q
@@ -519,9 +546,9 @@ async def main(
         end = time.time()
 
         if progress:
-            with open(progress, 'a') as f:
-                f.write('%d (%.2fs)\n' % (count, end - start))
-                f.write('\t'.join(PLogEntry._fields) + '\n')
+            async with aiofiles.open(progress, 'a') as f:
+                await f.write('%d (%.2fs)\n' % (count, end - start))
+                await f.write('\t'.join(PLogEntry._fields) + '\n')
 
         plog.log(
             PLogEntry(0, count, '0.00%', 0, '?', '?', '?', '?', '?', start_at or '?')
@@ -565,8 +592,9 @@ async def main(
                         cached=len(db.cache) + len(db2.cache),
                     )
 
-                    # cache ratings
+                    # cache ratings and reading logs
                     db2.cache_work_ratings(*key_range)
+                    db2.cache_work_reading_logs(*key_range)
                 elif job == "orphans":
                     # cache editions' ocaid metadata
                     ocaids_time, _ = await simple_timeit_async(
@@ -585,8 +613,12 @@ async def main(
                         q_auth=plog.last_entry.q_auth + authors_time,
                         cached=len(db.cache) + len(db2.cache),
                     )
+                elif job == 'lists':
+                    # Nothing to cache ; just need the lists themselves and
+                    # they are already cached
+                    pass
                 elif job == "authors":
-                    # Nothing to cache; update_work.py queries solr directly for each
+                    # Nothing to cache; update.py queries solr directly for each
                     # other, and provides no way to cache.
                     pass
 
@@ -595,6 +627,7 @@ async def main(
                 db.ia_cache.update(db2.ia_cache)
                 db.cached_work_editions_ranges += db2.cached_work_editions_ranges
                 db.cached_work_ratings.update(db2.cached_work_ratings)
+                db.cached_work_reading_logs.update(db2.cached_work_reading_logs)
 
             await update_keys(
                 keys,
