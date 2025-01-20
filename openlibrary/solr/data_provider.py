@@ -5,22 +5,25 @@ data required for solr.
 
 Multiple data providers are supported, each is good for different use case.
 """
+
 import asyncio
 import itertools
 import logging
 import re
-from typing import List, Optional, TypedDict
 from collections.abc import Iterable, Sized
+from typing import TypedDict, cast
 
 import httpx
-from httpx import HTTPError
 import requests
 import web
+from httpx import HTTPError
 from web import DB
 
 from infogami.infobase.client import Site
 from openlibrary.core import ia
+from openlibrary.core.bookshelves import Bookshelves
 from openlibrary.core.ratings import Ratings, WorkRatingsSummary
+from openlibrary.utils import extract_numeric_id_from_olid
 
 logger = logging.getLogger("openlibrary.solr.data_provider")
 
@@ -34,6 +37,8 @@ def get_data_provider(type="default"):
         return BetterDataProvider()
     elif type == "legacy":
         return LegacyDataProvider()
+    else:
+        raise ValueError("unknown data provider type: %s" % type)
 
 
 def is_valid_ocaid(ocaid: str):
@@ -104,10 +109,17 @@ def partition(lst: list, parts: int):
     parts = min(total_len, parts)
     size = total_len // parts
 
-    for i in range(0, parts):
+    for i in range(parts):
         start = i * size
         end = total_len if (i == parts - 1) else ((i + 1) * size)
         yield lst[start:end]
+
+
+class WorkReadingLogSolrSummary(TypedDict):
+    readinglog_count: int
+    want_to_read_count: int
+    currently_reading_count: int
+    already_read_count: int
 
 
 class DataProvider:
@@ -120,7 +132,7 @@ class DataProvider:
     """
 
     def __init__(self) -> None:
-        self.ia_cache: dict[str, Optional[dict]] = dict()
+        self.ia_cache: dict[str, dict | None] = {}
 
     @staticmethod
     async def _get_lite_metadata(ocaids: list[str], _recur_depth=0, _max_recur_depth=3):
@@ -143,6 +155,9 @@ class DataProvider:
                 r = await client.get(
                     "https://archive.org/advancedsearch.php",
                     timeout=30,  # The default is silly short
+                    headers={
+                        'x-application-id': 'ol-solr',
+                    },
                     params={
                         'q': f"identifier:({' OR '.join(ocaids)})",
                         'rows': len(ocaids),
@@ -150,6 +165,7 @@ class DataProvider:
                         'page': 1,
                         'output': 'json',
                         'save': 'yes',
+                        'service': 'metadata__unlimited',
                     },
                 )
             r.raise_for_status()
@@ -201,7 +217,7 @@ class DataProvider:
         :param str key: type-prefixed key (ex: /books/OL1M)
         :rtype: dict
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def get_metadata(self, identifier: str):
         if identifier in self.ia_cache:
@@ -213,13 +229,10 @@ class DataProvider:
             logger.debug("IA metadata cache miss")
             return ia.get_metadata_direct(identifier)
 
-    async def preload_documents(self, keys):
+    async def preload_documents(self, keys: Iterable[str]):
         """
         Preload a set of documents in a single request. Should make subsequent calls to
         get_document faster.
-
-        :param list of str keys: type-prefixed keys to load (ex: /books/OL1M)
-        :return: None
         """
         pass
 
@@ -237,18 +250,18 @@ class DataProvider:
 
         missing_ocaids = [ocaid for ocaid in valid_ocaids if ocaid not in self.ia_cache]
         missing_ocaid_batches = list(batch(missing_ocaids, 6))
-        for ocaids in missing_ocaid_batches:
+        for missing_batch in missing_ocaid_batches:
             # Start them all async
             tasks = [
                 asyncio.create_task(self._get_lite_metadata_direct(ocaid))
-                for ocaid in ocaids
+                for ocaid in missing_batch
             ]
             for task in tasks:
                 lite_metadata = await task
                 if lite_metadata:
                     self.ia_cache[lite_metadata['identifier']] = lite_metadata
 
-    def preload_editions_of_works(self, work_keys):
+    def preload_editions_of_works(self, work_keys: Iterable[str]):
         """
         Preload the editions of the provided works. Should make subsequent calls to
         get_editions_of_work faster.
@@ -265,7 +278,7 @@ class DataProvider:
         :param str key: type-prefixed key
         :rtype: list of str
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def get_editions_of_work(self, work):
         """
@@ -273,10 +286,13 @@ class DataProvider:
         :param dict work: work object
         :rtype: list of dict
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
-    def get_work_ratings(self, work_key: str) -> Optional[WorkRatingsSummary]:
-        raise NotImplementedError()
+    def get_work_ratings(self, work_key: str) -> WorkRatingsSummary | None:
+        raise NotImplementedError
+
+    def get_work_reading_log(self, work_key: str) -> WorkReadingLogSolrSummary | None:
+        raise NotImplementedError
 
     def clear_cache(self):
         self.ia_cache.clear()
@@ -305,9 +321,20 @@ class LegacyDataProvider(DataProvider):
         logger.info("get_document %s", key)
         return self._withKey(key)
 
-    def get_work_ratings(self, work_key: str) -> Optional[WorkRatingsSummary]:
+    def get_work_ratings(self, work_key: str) -> WorkRatingsSummary | None:
         work_id = int(work_key[len('/works/OL') : -len('W')])
         return Ratings.get_work_ratings_summary(work_id)
+
+    def get_work_reading_log(self, work_key: str) -> WorkReadingLogSolrSummary:
+        work_id = extract_numeric_id_from_olid(work_key)
+        counts = Bookshelves.get_work_summary(work_id)
+        return cast(
+            WorkReadingLogSolrSummary,
+            {
+                'readinglog_count': sum(counts.values()),
+                **{f'{shelf}_count': count for shelf, count in counts.items()},
+            },
+        )
 
     def clear_cache(self):
         # Nothing's cached, so nothing to clear!
@@ -336,7 +363,9 @@ class ExternalDataProvider(DataProvider):
         return resp['entries']
 
     async def get_document(self, key: str):
-        return requests.get(f"http://{self.ol_host}{key}.json").json()
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"http://{self.ol_host}{key}.json")
+            return response.json()
 
 
 class BetterDataProvider(LegacyDataProvider):
@@ -372,7 +401,7 @@ class BetterDataProvider(LegacyDataProvider):
             infogami._setup()
             delegate.fakeload()
 
-            from openlibrary.solr.process_stats import get_db
+            from openlibrary.core.db import get_db
 
             self.db: DB = get_db()
         else:
@@ -383,17 +412,11 @@ class BetterDataProvider(LegacyDataProvider):
         if key not in self.cache:
             await self.preload_documents([key])
         if key not in self.cache:
-            logger.warn("NOT FOUND %s", key)
+            logger.warning("NOT FOUND %s", key)
         return self.cache.get(key) or {"key": key, "type": {"key": "/type/delete"}}
 
-    async def preload_documents(self, keys):
-        identifiers = [
-            k.replace("/books/ia:", "") for k in keys if k.startswith("/books/ia:")
-        ]
-        # self.preload_ia_items(identifiers)
-        re_key = web.re_compile(r"/(books|works|authors)/OL\d+[MWA]")
-
-        keys2 = {k for k in keys if re_key.match(k)}
+    async def preload_documents(self, keys: Iterable[str]):
+        keys2 = set(keys)
         # keys2.update(k for k in self.ia_redirect_cache.values() if k is not None)
         self.preload_documents0(keys2)
         self._preload_works()
@@ -434,9 +457,8 @@ class BetterDataProvider(LegacyDataProvider):
     async def _preload_metadata_of_editions(self):
         identifiers = []
         for doc in self.cache.values():
-            if doc and doc['type']['key'] == '/type/edition':
-                if doc.get('ocaid'):
-                    identifiers.append(doc['ocaid'])
+            if doc and doc['type']['key'] == '/type/edition' and doc.get('ocaid'):
+                identifiers.append(doc['ocaid'])
                 # source_records = doc.get("source_records", [])
                 # identifiers.extend(r[len("ia:"):] for r in source_records if r.startswith("ia:"))
         await self.preload_metadata(identifiers)
@@ -484,7 +506,7 @@ class BetterDataProvider(LegacyDataProvider):
         edition_keys = self.edition_keys_of_works_cache.get(wkey, [])
         return [self.cache[k] for k in edition_keys]
 
-    def preload_editions_of_works(self, work_keys):
+    def preload_editions_of_works(self, work_keys: Iterable[str]):
         work_keys = [
             wkey for wkey in work_keys if wkey not in self.edition_keys_of_works_cache
         ]
@@ -497,18 +519,18 @@ class BetterDataProvider(LegacyDataProvider):
         # time consuming.
         key_query = (
             "select id from property where name='works'"
-            + " and type=(select id from thing where key='/type/edition')"
+            " and type=(select id from thing where key='/type/edition')"
         )
 
         q = (
             "SELECT edition.key as edition_key, work.key as work_key"
-            + " FROM thing as edition, thing as work, edition_ref"
-            + " WHERE edition_ref.thing_id=edition.id"
-            + "   AND edition_ref.value=work.id"
-            + f"   AND edition_ref.key_id=({key_query})"
-            + "   AND work.key in $keys"
+            " FROM thing as edition, thing as work, edition_ref"
+            " WHERE edition_ref.thing_id=edition.id"
+            "   AND edition_ref.value=work.id"
+            f"   AND edition_ref.key_id=({key_query})"
+            "   AND work.key in $keys"
         )
-        result = self.db.query(q, vars=dict(keys=work_keys))
+        result = self.db.query(q, vars={"keys": work_keys})
         for row in result:
             self.edition_keys_of_works_cache.setdefault(row.work_key, []).append(
                 row.edition_key
